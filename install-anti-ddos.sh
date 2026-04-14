@@ -2,7 +2,7 @@
 
 # ============================================
 # HAMZ-FLARE - Anti DDoS untuk Pterodactyl
-# Cloudflare Style Challenge Page
+# Mengambil HTML dari GitHub
 # ============================================
 
 RED='\033[0;31m'
@@ -15,26 +15,168 @@ clear
 echo -e "${BLUE}"
 echo "╔════════════════════════════════════════════════╗"
 echo "║         HAMZ-FLARE ANTI-DDoS SETUP             ║"
-echo "║         Untuk VPS Pterodactyl Panel            ║"
+echo "║     Langsung Connect ke Pterodactyl Panel      ║"
 echo "╚════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
-# Cek domain yang terdaftar di Pterodactyl
-echo -e "${YELLOW}📋 Mendeteksi domain yang terdaftar di Pterodactyl...${NC}"
-DOMAINS=$(mysql -u root -p$(grep -oP "(?<=DB_PASSWORD=).*" /var/www/pterodactyl/.env 2>/dev/null) -e "SELECT domain FROM panel.nodes WHERE public=1;" pterodactyl 2>/dev/null)
-
-if [ -z "$DOMAINS" ]; then
-    # Ambil dari konfigurasi nginx
-    DOMAINS=$(grep -h "server_name" /etc/nginx/sites-available/pterodactyl.conf 2>/dev/null | grep -v "_" | awk '{print $2}' | sed 's/;//g' | head -5)
+# Backup konfigurasi
+echo -e "${YELLOW}[1/4] Backup konfigurasi Nginx...${NC}"
+if [ -f /etc/nginx/sites-available/pterodactyl.conf ]; then
+    cp /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-available/pterodactyl.conf.bak.$(date +%Y%m%d_%H%M%S)
+    echo -e "${GREEN}✓ Backup berhasil${NC}"
+else
+    echo -e "${RED}File pterodactyl.conf tidak ditemukan!${NC}"
+    exit 1
 fi
 
-echo -e "${GREEN}Domain yang terdeteksi:${NC}"
-echo "$DOMAINS" | nl
-echo "0. Masukkan domain manual"
+# Buat direktori challenge
+echo -e "${YELLOW}[2/4] Membuat direktori challenge...${NC}"
+mkdir -p /var/www/hamzflare/challenge
 
+# Download HTML challenge page dari GitHub
+echo -e "${YELLOW}[3/4] Download challenge page dari GitHub...${NC}"
+curl -fsSL -o /var/www/hamzflare/challenge/index.html \
+    https://raw.githubusercontent.com/hamzxdevbot/hamzantiddos/main/index.html
+
+if [ -f /var/www/hamzflare/challenge/index.html ]; then
+    echo -e "${GREEN}✓ Challenge page berhasil di-download${NC}"
+else
+    echo -e "${RED}Gagal download challenge page!${NC}"
+    exit 1
+fi
+
+# Update Nginx config
+echo -e "${YELLOW}[4/4] Mengupdate konfigurasi Nginx...${NC}"
+
+cat > /etc/nginx/sites-available/pterodactyl.conf << 'EOF'
+# Rate Limiting Zones
+limit_req_zone $binary_remote_addr zone=ddos_limit:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=login_limit:10m rate=2r/s;
+limit_conn_zone $binary_remote_addr zone=conn_limit:10m;
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
+
+    # Root Pterodactyl
+    root /var/www/pterodactyl/public;
+    index index.php;
+
+    # Security Headers
+    server_tokens off;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Hamz-Flare "Active" always;
+
+    # Rate limiting default
+    limit_req zone=ddos_limit burst=20 nodelay;
+    limit_req_status 429;
+    limit_conn conn_limit 20;
+
+    # Cookie verification
+    map $cookie_hamzflare_verified $verified_user {
+        default 0;
+        "true" 1;
+    }
+
+    # Challenge page untuk unverified
+    location / {
+        if ($verified_user = 1) {
+            try_files $uri $uri/ /index.php?$query_string;
+            break;
+        }
+        root /var/www/hamzflare/challenge;
+        try_files /index.html =404;
+    }
+
+    # Proteksi login
+    location /auth/login {
+        limit_req zone=login_limit burst=3 nodelay;
+        limit_req_status 429;
+        limit_conn conn_limit 5;
+        add_header X-RateLimit-Limit "2r/s" always;
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    # Proteksi admin
+    location /admin {
+        limit_req zone=ddos_limit burst=10 nodelay;
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    # API protection
+    location /api {
+        limit_req zone=ddos_limit burst=15 nodelay;
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+
+    # Static files (bypass limit)
+    location ~* \.(css|js|jpg|jpeg|png|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+        limit_req off;
+        limit_conn off;
+        try_files $uri =404;
+    }
+
+    # PHP processing
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.3-fpm.sock;
+        fastcgi_read_timeout 30s;
+        fastcgi_connect_timeout 10s;
+        fastcgi_buffers 16 16k;
+        fastcgi_buffer_size 32k;
+    }
+
+    # Block bad patterns
+    location ~ /\.(env|git|sql|bak|config) {
+        deny all;
+        return 403;
+    }
+
+    # Error page rate limit
+    error_page 429 /429.html;
+    location = /429.html {
+        internal;
+        return 429 "🚫 Rate limit exceeded. Slow down!\n";
+        add_header Content-Type text/plain;
+    }
+}
+EOF
+
+# Test dan reload Nginx
+echo -e "${YELLOW}Testing konfigurasi Nginx...${NC}"
+nginx -t
+
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✓ Konfigurasi valid${NC}"
+    systemctl reload nginx
+    echo -e "${GREEN}✓ Nginx berhasil di-reload${NC}"
+else
+    echo -e "${RED}✗ Konfigurasi error, restoring backup...${NC}"
+    mv /etc/nginx/sites-available/pterodactyl.conf.bak.* /etc/nginx/sites-available/pterodactyl.conf
+    systemctl reload nginx
+    exit 1
+fi
+
+# Selesai
+clear
+echo -e "${GREEN}"
+echo "╔════════════════════════════════════════════════╗"
+echo "║     HAMZ-FLARE ANTI-DDoS ACTIVE!               ║"
+echo "╚════════════════════════════════════════════════╝"
+echo -e "${NC}"
+echo -e "${GREEN}✅ Fitur aktif:${NC}"
+echo "   ✓ Challenge Page (Cloudflare style)"
+echo "   ✓ Rate Limiting: 10 req/detik"
+echo "   ✓ Login Protection: 2 req/detik"
+echo "   ✓ Connection Limit: 20 per IP"
+echo "   ✓ Cookie Verification (1 jam)"
 echo ""
-read -p "Pilih nomor domain (0-${#DOMAINS[@]}): " DOMAIN_CHOICE
-
+echo -e "${CYAN}🛡️ Hamz-Flare protecting your panel!${NC}"
 if [ "$DOMAIN_CHOICE" == "0" ]; then
     read -p "Masukkan domain Anda (contoh: panel.domain.com): " DOMAIN
 else
